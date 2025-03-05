@@ -1,0 +1,24 @@
+{
+  "unique_tags": [
+    "fallback",
+    "availability",
+    "gift",
+    "address",
+    "order_oil",
+    "goodbye",
+    "greeting",
+    "price"
+  ],
+  "tag_to_index": {
+    "fallback": 0,
+    "availability": 1,
+    "gift": 2,
+    "address": 3,
+    "order_oil": 4,
+    "goodbye": 5,
+    "greeting": 6,
+    "price": 7
+  },
+  "max_len": 20,
+  "max_tokens": 10000
+}
