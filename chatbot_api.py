@@ -1,159 +1,179 @@
-from flask import Flask, request, jsonify
-import numpy as np
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import tensorflow as tf
+import pickle
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+import uvicorn
 import json
-import random
 import re
+from sklearn.preprocessing import LabelEncoder
+import logging
 
-app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Load the model and required data
-def load_model_and_data():
-    # Load the trained model
-    model = tf.keras.models.load_model("chatbot_model.keras")
+app = FastAPI(
+    title="Arabic Intent Classification API",
+    description="API for classifying Egyptian Arabic intents related to oil collection",
+    version="1.0.0"
+)
+
+# Load model components
+try:
+    logger.info("Loading model components...")
+    model = tf.keras.models.load_model("advanced_arabic_intent_model.h5")
+    with open("advanced_tokenizer.pkl", "rb") as f:
+        tokenizer = pickle.load(f)
+    with open("advanced_encoder.pkl", "rb") as f:
+        encoder = pickle.load(f)
+    with open("max_len.pkl", "rb") as f:
+        max_len = pickle.load(f)
+    with open("training_data.json", "r", encoding='utf-8') as f:
+        data = json.load(f)
+        intents = data["intents"] if "intents" in data else data
+    logger.info("Model components loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading model components: {str(e)}")
+    raise
+
+# Dialogue State Machine
+class DialogueStateMachine:
+    def __init__(self):
+        self.conversations = {}
     
-    # Load vocabulary
-    with open("word_index.json", "r", encoding="utf-8") as f:
-        word_index = json.load(f)
-    
-    # Load training data for responses
-    with open("training_data.json", "r", encoding="utf-8") as f:
-        training_data = json.load(f)
-      # Try to load metadata for tag ordering
+    def get_state(self, user_id):
+        return self.conversations.get(user_id, {"state": "STARTED", "context": {}})
+
+    def update_state(self, user_id, new_state, context_update=None):
+        current = self.get_state(user_id)
+        if context_update:
+            current["context"].update(context_update)
+        current["state"] = new_state
+        self.conversations[user_id] = current
+        logger.info(f"User {user_id} state updated: {current}")
+        return current
+
+    def guide_back(self, user_id, intent_tag):
+        current = self.get_state(user_id)
+        state = current["state"]
+        context = current["context"]
+        if state == "AWAITING_QUANTITY":
+            return "تمام يا فندم، ممكن نحدد كمية الزيت عشان نكمل الطلب؟"
+        elif state == "AWAITING_ADDRESS":
+            return f"حلو، سجلنا الكمية: {context.get('quantity', 'غير محدد')} لتر. ممكن تقول لي عنوانك؟"
+        elif state == "AWAITING_GIFT":
+            return f"كده عندنا {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')}. عايز تختار هدية مع الطلب؟ (مثلًا: كوبون خصم)"
+        elif state == "AWAITING_CONFIRMATION":
+            return f"كده عندنا {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')} والهدية: {context.get('gift', 'بدون هدية')}. نكمل الطلب؟"
+        return "لو عايز تطلب جمع زيت، قول لي كام لتر عندك!"
+
+state_machine = DialogueStateMachine()
+
+class TextInput(BaseModel):
+    text: str
+    user_id: str
+
+class ArabicJSONResponse(JSONResponse):
+    def render(self, content) -> bytes:
+        return json.dumps(content, ensure_ascii=False, indent=2).encode("utf-8")
+
+def predict_intent(text: str, user_id: str):
     try:
-        with open("model_metadata.json", "r", encoding="utf-8") as f:
-            metadata = json.load(f)
-            unique_tags = metadata["unique_tags"]
-            print("✅ Loaded tag ordering from metadata")
-    except:
-        # Extract unique tags from training data if metadata not available
-        unique_tags = []
-        for intent in training_data['intents']:
-            unique_tags.append(intent['tag'])
-        print("⚠️ Using tag ordering from training data")
-    
-    
-     # Try to load vectorizer config if available
-    vectorizer_config = None
+        sequence = tokenizer.texts_to_sequences([text])
+        padded_sequence = pad_sequences(sequence, maxlen=max_len, padding="post")
+        prediction = model.predict(padded_sequence, verbose=0)
+        predicted_class_idx = np.argmax(prediction[0])
+        confidence = float(prediction[0][predicted_class_idx])
+        intent_tag = encoder.inverse_transform([predicted_class_idx])[0]
+
+        current_state = state_machine.get_state(user_id)
+        state = current_state["state"]
+        context = current_state["context"]
+        response = None
+
+        # Core state machine logic
+        if intent_tag == "greeting" and state == "STARTED":
+            response = "وعليكم السلام يا فندم! كام لتر زيت عندك عشان نجمعهم؟"
+            current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY")
+
+        elif intent_tag == "provide_quantity" and state == "AWAITING_QUANTITY":
+            match = re.search(r'\d+', text)
+            amount = match.group(0) if match else None
+            if amount:
+                context["quantity"] = amount
+                response = f"تمام، سجلنا الكمية: {amount} لتر. ممكن تقول لي عنوانك الكامل؟"
+                current_state = state_machine.update_state(user_id, "AWAITING_ADDRESS", {"quantity": amount})
+            else:
+                response = "مفهمتش الكمية، ممكن تقول لي كام لتر بالظبط؟"
+
+        elif intent_tag == "provide_address" and state == "AWAITING_ADDRESS":
+            context["address"] = text.strip()
+            response = f"حلو، سجلنا العنوان: {text}. عايز تختار هدية مع الطلب؟ (مثلًا: كوبون خصم)"
+            current_state = state_machine.update_state(user_id, "AWAITING_GIFT", {"address": text})
+
+        elif intent_tag == "choose_gift" and state == "AWAITING_GIFT":
+            gift = text.strip()
+            context["gift"] = gift
+            response = f"تمام، اخترنا الهدية: {gift}. كده عندنا {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')}. نكمل الطلب؟"
+            current_state = state_machine.update_state(user_id, "AWAITING_CONFIRMATION", {"gift": gift})
+
+        elif intent_tag == "submit_order" and state == "AWAITING_CONFIRMATION":
+            response = f"تم تسجيل طلبك بنجاح! هنيجي نجمع {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')} والهدية: {context.get('gift', 'بدون هدية')}. شكرًا يا فندم!"
+            current_state = state_machine.update_state(user_id, "STARTED")
+
+        elif intent_tag == "choose_gift" and state in ["STARTED", "AWAITING_QUANTITY"]:
+            gift = text.strip()
+            response = f"تمام، اخترنا الهدية: {gift}. لو عايز تطلب زيت معاها، قول لي الكمية!"
+            current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY", {"gift": gift})
+
+        elif intent_tag == "ask_for_help":
+            response = "تحت أمرك! لو محتاج مساعدة في حاجة معينة، قول لي وأنا أساعدك."
+
+        # Guide back to context if no specific response
+        if not response:
+            response = state_machine.guide_back(user_id, intent_tag)
+            current_state = state_machine.get_state(user_id)
+
+        logger.info(f"Returning response for {user_id}: {response}")
+        return {
+            "intent": intent_tag,
+            "confidence": confidence,
+            "response": response,
+            "state": current_state["state"]
+        }
+    except Exception as e:
+        logger.error(f"Error in predict_intent: {str(e)}")
+        raise
+
+@app.post("/predict", response_class=ArabicJSONResponse)
+async def predict(input: TextInput):
     try:
-        with open("vectorizer_config.json", "r", encoding="utf-8") as f:
-            vectorizer_config = json.load(f)
-            print("✅ Loaded vectorizer configuration")
-    except:
-        print("⚠️ Vectorizer configuration not found, using word_index directly")
-    
-    # Extract responses
-    responses = {}
-    fallback_tag = None
-    
-    for intent in training_data['intents']:
-        responses[intent['tag']] = intent['responses']
-        if intent['tag'] == 'fallback':
-            fallback_tag = 'fallback'
-    
-    return model, word_index, unique_tags, responses, vectorizer_config, fallback_tag
-    
+        if not input.text.strip():
+            raise HTTPException(status_code=400, detail="Text input cannot be empty")
+        result = predict_intent(input.text, input.user_id)
+        return {
+            "status": "success",
+            "data": {
+                "original_text": input.text,
+                "state": result["state"],
+                "predicted_intent": result["intent"],
+                "confidence": result["confidence"],
+                "response": result["response"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"Prediction endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
 
-# Load everything at startup
-model, word_index, unique_tags, responses, vectorizer_config, fallback_tag = load_model_and_data()
+@app.get("/", response_class=ArabicJSONResponse)
+async def root():
+    return {"message": "Welcome to Arabic Intent Classification API"}
 
-# Enhanced Arabic text preprocessing to match Colab training
-def preprocess_arabic_text(text):
-    # Convert to lowercase (though less important for Arabic)
-    text = text.lower()
-    # Remove non-Arabic characters except spaces
-    text = re.sub(r'[^\u0600-\u06FF\s]', '', text)
-    # Normalize Arabic characters
-    text = re.sub(r'[ًٌٍَُِّْ]', '', text)  # Remove diacritics
-    # Normalize alef variations
-    text = re.sub(r'[إأآا]', 'ا', text)
-    # Normalize yaa variations
-    text = re.sub(r'[يى]', 'ي', text)
-    # Normalize taa marbuta
-    text = re.sub(r'ة', 'ه', text)
-    # Normalize hamza variations
-    text = re.sub(r'[ؤئ]', 'ء', text)
-    return text
+@app.get("/health", response_class=ArabicJSONResponse)
+async def health_check():
+    return {"status": "healthy", "message": "API is running"}
 
-# Create a function to convert text to sequence
-def text_to_sequence(text, word_index, max_len=20):
-    # Preprocess the text
-    text = preprocess_arabic_text(text)
-    
-    # Convert to sequence
-    words = text.split()
-    sequence = np.zeros(max_len, dtype=np.int32)
-    
-    for i, word in enumerate(words):
-        if i < max_len:
-            # Use 0 for unknown words (0 is reserved for padding)
-            sequence[i] = word_index.get(word, 1)  # 1 for OOV token
-    
-    return sequence
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    # Get the input text from the request
-    data = request.json
-    user_input = data.get('text', '')
-    
-    if not user_input:
-        return jsonify({'error': 'No text provided'}), 400
-    
-    # Preprocess input
-    processed_input = preprocess_arabic_text(user_input)
-    
-    # Convert input to sequence
-    sequence = text_to_sequence(processed_input, word_index)
-    
-    # Make prediction
-    prediction = model.predict(np.array([sequence]))
-    predicted_tag_index = np.argmax(prediction[0])
-    
-    # Get the tag and confidence
-    predicted_tag = unique_tags[predicted_tag_index]
-    confidence = float(prediction[0][predicted_tag_index])
-    
-    # Get all confidences for debugging
-    all_confidences = {tag: float(prediction[0][i]) for i, tag in enumerate(unique_tags)}
-    
-    # Set confidence threshold
-    confidence_threshold = 0.5
-    
-    # Use fallback if confidence is too low and fallback tag exists
-    threshold_applied = False
-    if confidence < confidence_threshold and fallback_tag:
-        predicted_tag = fallback_tag
-        threshold_applied = True
-    
-    # Get a random response for the predicted tag
-    response = random.choice(responses[predicted_tag])
-    
-    # Return the prediction results with additional info
-    return jsonify({
-        'tag': predicted_tag,
-        'confidence': confidence,
-        'response': response,
-        'processed_input': processed_input,
-        'threshold_applied': threshold_applied,
-        'all_confidences': all_confidences
-    })
-# Health check endpoint
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'ok',
-        'model_loaded': model is not None,
-        'available_tags': unique_tags
-    })
-
-# Add CORS support for testing
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
