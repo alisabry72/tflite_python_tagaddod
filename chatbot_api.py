@@ -54,6 +54,13 @@ class DialogueStateMachine:
         self.conversations[user_id] = current
         logger.info(f"User {user_id} state updated: {current}")
         return current
+    
+    def clear_session(self, user_id):
+        if user_id in self.conversations:
+            del self.conversations[user_id]
+            logger.info(f"User {user_id} session cleared")
+            return True
+        return False
 
     def guide_back(self, user_id, intent_tag):
         current = self.get_state(user_id)
@@ -67,12 +74,15 @@ class DialogueStateMachine:
             return f"كده عندنا {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')}. عايز تختار هدية مع الطلب؟ (مثلًا: كوبون خصم)"
         elif state == "AWAITING_CONFIRMATION":
             return f"كده عندنا {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')} والهدية: {context.get('gift', 'بدون هدية')}. نكمل الطلب؟"
-        return "لو عايز تطلب جمع زيت، قول لي كام لتر عندك!"
+        return "السلام عليكم نقدر نساعد حضرتك ازاي"
 
 state_machine = DialogueStateMachine()
 
 class TextInput(BaseModel):
     text: str
+    user_id: str
+
+class SessionInput(BaseModel):
     user_id: str
 
 class ArabicJSONResponse(JSONResponse):
@@ -98,15 +108,23 @@ def predict_intent(text: str, user_id: str):
             response = "وعليكم السلام يا فندم! كام لتر زيت عندك عشان نجمعهم؟"
             current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY")
 
-        elif intent_tag == "provide_quantity" and state == "AWAITING_QUANTITY":
-            match = re.search(r'\d+', text)
-            amount = match.group(0) if match else None
-            if amount:
-                context["quantity"] = amount
-                response = f"تمام، سجلنا الكمية: {amount} لتر. ممكن تقول لي عنوانك الكامل؟"
-                current_state = state_machine.update_state(user_id, "AWAITING_ADDRESS", {"quantity": amount})
+        # Enforce strict flow - user must provide quantity first
+        elif state == "STARTED" or state == "AWAITING_QUANTITY":
+            # If the user sent a provide_quantity intent, process it
+            if intent_tag == "provide_quantity":
+                match = re.search(r'\d+', text)
+                amount = match.group(0) if match else None
+                if amount:
+                    context["quantity"] = amount
+                    response = f"تمام، سجلنا الكمية: {amount} لتر. ممكن تقول لي عنوانك الكامل؟"
+                    current_state = state_machine.update_state(user_id, "AWAITING_ADDRESS", {"quantity": amount})
+                else:
+                    response = "مفهمتش الكمية، ممكن تقول لي كام لتر بالظبط؟"
+                    current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY")
+            # If it's any other intent, keep asking for quantity
             else:
-                response = "مفهمتش الكمية، ممكن تقول لي كام لتر بالظبط؟"
+                response = "نحتاج نعرف كمية الزيت الأول. ممكن تقول لي كام لتر عندك؟"
+                current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY")
 
         elif intent_tag == "provide_address" and state == "AWAITING_ADDRESS":
             context["address"] = text.strip()
@@ -123,13 +141,9 @@ def predict_intent(text: str, user_id: str):
             response = f"تم تسجيل طلبك بنجاح! هنيجي نجمع {context.get('quantity', 'غير محدد')} لتر زيت من {context.get('address', 'غير محدد')} والهدية: {context.get('gift', 'بدون هدية')}. شكرًا يا فندم!"
             current_state = state_machine.update_state(user_id, "STARTED")
 
-        elif intent_tag == "choose_gift" and state in ["STARTED", "AWAITING_QUANTITY"]:
-            gift = text.strip()
-            response = f"تمام، اخترنا الهدية: {gift}. لو عايز تطلب زيت معاها، قول لي الكمية!"
-            current_state = state_machine.update_state(user_id, "AWAITING_QUANTITY", {"gift": gift})
-
         elif intent_tag == "ask_for_help":
             response = "تحت أمرك! لو محتاج مساعدة في حاجة معينة، قول لي وأنا أساعدك."
+            # Still maintain the current state
 
         # Guide back to context if no specific response
         if not response:
@@ -166,6 +180,17 @@ async def predict(input: TextInput):
     except Exception as e:
         logger.error(f"Prediction endpoint error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Prediction error: {str(e)}")
+
+@app.post("/end_session", response_class=ArabicJSONResponse)
+async def end_session(input: SessionInput):
+    """
+    Endpoint to clear a user's session when they leave the chat screen
+    """
+    success = state_machine.clear_session(input.user_id)
+    if success:
+        return {"status": "success", "message": "User session cleared successfully"}
+    else:
+        return {"status": "success", "message": "No active session found for this user"}
 
 @app.get("/", response_class=ArabicJSONResponse)
 async def root():
